@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+
+# SCOPEZERO local state and sensitive assessment data
+backend/scopezero.db
+backend/scopezero.db-*
+backend/*.sqlite
+backend/*.sqlite3
+backend/.session_vault.key
+backend/evidence/
+backend/uploads/
+backend/reports/
+backend/exports/
+
+# Logs and generated output
+*.log
+logs/
+reports/
+exports/
+output/
+tmp/
+temp/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Packaging
+build/
+dist/
+*.egg-info/
+*.zip
