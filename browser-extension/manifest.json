@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "SCOPEZERO Browser Capture",
+  "version": "1.1.0",
+  "description": "Capture in-scope browser request metadata into a local SCOPEZERO engagement with connection diagnostics.",
+  "permissions": [
+    "storage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SCOPEZERO Capture"
+  },
+  "options_page": "options.html"
+}
