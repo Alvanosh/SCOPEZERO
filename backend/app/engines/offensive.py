@@ -6,6 +6,7 @@ from ..config import UA
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 import dns.resolver
+from .process import run_binary
 
 SECRET_PATTERNS = [
     ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -14,33 +15,59 @@ SECRET_PATTERNS = [
     ("Private key material", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
 ]
 
+_PUBLIC_DNS_CACHE = {}
+
 def is_public_host(host):
+    """Resolve a hostname quickly and reject private, loopback and mixed answers."""
+    key=str(host).lower().rstrip('.')
+    if key in _PUBLIC_DNS_CACHE:
+        return _PUBLIC_DNS_CACHE[key]
     try:
+        try:
+            ip=ipaddress.ip_address(key)
+            result=ip.is_global
+            _PUBLIC_DNS_CACHE[key]=result
+            return result
+        except ValueError:
+            pass
+        resolver=dns.resolver.Resolver()
+        resolver.timeout=0.7
+        resolver.lifetime=1.2
         answers=[]
-        r=dns.resolver.Resolver(); r.timeout=1; r.lifetime=2
-        for typ in ("A","AAAA"):
-            try: answers += [ipaddress.ip_address(x.to_text()) for x in r.resolve(host,typ)]
-            except Exception: pass
-        return bool(answers) and all(x.is_global for x in answers)
-    except Exception: return False
+        for typ in ("A", "AAAA"):
+            try:
+                answers.extend(ipaddress.ip_address(x.to_text()) for x in resolver.resolve(key, typ, lifetime=1.2))
+            except Exception:
+                continue
+        result=bool(answers) and all(x.is_global for x in answers)
+    except Exception:
+        result=False
+    _PUBLIC_DNS_CACHE[key]=result
+    if len(_PUBLIC_DNS_CACHE)>5000:
+        _PUBLIC_DNS_CACHE.clear()
+    return result
+
+def public_hosts(hosts, limit=50, workers=16):
+    """Bound and parallelize DNS eligibility checks without changing scope."""
+    all_candidates=list(dict.fromkeys(str(h).lower().rstrip('.') for h in hosts if h))
+    candidates=all_candidates[:max(limit*2,limit)]
+    if not candidates:
+        return [], 0
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers,len(candidates))) as pool:
+        flags=list(pool.map(is_public_host,candidates))
+    eligible=[h for h,ok in zip(candidates,flags) if ok]
+    return eligible[:limit], max(0,len(eligible)-limit), max(0,len(all_candidates)-len(candidates))
 
 def run_tool(name, args, timeout=180):
-    path=shutil.which(name)
-    if not path: return {"available":False,"error":f"{name} is not installed or not on PATH."}
-    try:
-        p=subprocess.run([path,*args],capture_output=True,text=True,timeout=timeout,check=False,
-                         env={**os.environ,"NO_COLOR":"1"})
-        return {"available":True,"returncode":p.returncode,"stdout":p.stdout[-200000:],"stderr":p.stderr[-20000:]}
-    except subprocess.TimeoutExpired:
-        return {"available":True,"error":f"{name} timed out after {timeout} seconds."}
-    except Exception as e: return {"available":True,"error":f"{type(e).__name__}: {e}"}
+    return run_binary(name,args,timeout=timeout)
 
 def nmap_scan(hosts):
-    hosts=[h for h in hosts if is_public_host(h)]
-    if not hosts: return {"available":shutil.which('nmap') is not None,"hosts_scanned":0,"results":[],"message":"No discovered public hosts eligible for scanning."}
+    hosts,omitted,not_checked=public_hosts(hosts,limit=40)
+    if not hosts: return {"available":shutil.which('nmap') is not None,"status":"preflight_incomplete" if not_checked else "no_targets","hosts_scanned":0,"not_checked_during_preflight":not_checked,"results":[],"message":"Preflight limit reached before any eligible host was confirmed; narrow the asset set and retry." if not_checked else "No discovered public hosts eligible for scanning."}
     with tempfile.TemporaryDirectory(prefix="scopezero-nmap-") as td:
         out=Path(td)/"scan.xml"
-        res=run_tool("nmap",["-sT","-sV","--version-light","--top-ports","100","-T3","--host-timeout","90s","-oX",str(out),*hosts],timeout=240)
+        res=run_tool("nmap",["-sT","-sV","--version-light","--top-ports","100","-T3","--host-timeout","35s","--max-retries","1","--max-rate","40","-oX",str(out),*hosts],timeout=180)
         parsed=[]
         if out.exists():
             import xml.etree.ElementTree as ET
@@ -55,76 +82,140 @@ def nmap_scan(hosts):
                           "service":svc.get('name') if svc is not None else "unknown","product":svc.get('product') if svc is not None else None,
                           "version":svc.get('version') if svc is not None else None})
             except Exception: pass
-        return {"available":res.get("available",False),"hosts_scanned":len(hosts),"results":parsed,"tool_error":res.get('error'),"returncode":res.get('returncode'),"mode":"TCP connect, top 100 ports, light service detection"}
+        status=res.get("status") if res.get("status") not in ("completed",None) else ("matches_found" if parsed else "no_matches")
+        return {"available":res.get("available",False),"status":status,"hosts_scanned":len(hosts),"omitted_after_target_cap":omitted,"not_checked_during_preflight":not_checked,"results":parsed,"tool_error":res.get('error'),"returncode":res.get('returncode'),"stderr_tail":res.get("stderr","")[-4000:],"diagnostics":res.get("diagnostics"),"elapsed_seconds":res.get("elapsed_seconds"),"message":res.get("error") or f"Nmap completed against {len(hosts)} public in-scope host(s); {len(parsed)} port/service observations recorded.","mode":"TCP connect, top 100 ports, light service detection; max 40 hosts per run"}
 
 def nuclei_scan(hosts):
-    hosts=[h for h in hosts if is_public_host(h)]
+    """Run bounded HTTP-focused Nuclei templates in small batches.
+
+    Includes HTTP, misconfiguration and vulnerability-tagged templates while
+    excluding known intrusive classes. Results are observations requiring
+    analyst validation, not proof of exploitability.
+    """
+    hosts, omitted, not_checked = public_hosts(hosts, limit=25)
     if not hosts:
-        return {"available":shutil.which("nuclei") is not None,"status":"no_targets","targets_count":0,
-                "results":[],"message":"No discovered public hostnames are eligible for this check."}
+        return {"available": shutil.which("nuclei") is not None,
+                "status": "preflight_incomplete" if not_checked else "no_targets",
+                "targets_count": 0, "not_checked_during_preflight": not_checked,
+                "results": [],
+                "message": "Preflight limit reached before any eligible host was confirmed; narrow the asset set and retry." if not_checked else "No discovered public hostnames are eligible for this check."}
+
+    path = shutil.which("nuclei")
+    if not path:
+        return {"available": False, "status": "not_installed", "targets_count": len(hosts),
+                "results": [], "message": "Nuclei is not installed or not available on PATH."}
+
+    findings = []
+    batch_diagnostics = []
+    parsed = unparsed = 0
+    completed_batches = timed_out_batches = failed_batches = 0
+    # Small batches avoid a single slow host holding up the entire assessment.
+    batch_size = 5
     with tempfile.TemporaryDirectory(prefix="scopezero-nuclei-") as td:
-        targets=Path(td)/"targets.txt"
-        targets.write_text("\n".join("https://"+h for h in hosts)+"\n")
-        # Restrict checks to non-intrusive misconfiguration, exposure and TLS templates.
-        args=["-list",str(targets),"-tags","misconfig,exposure,ssl",
-              "-exclude-tags","dos,intrusive,fuzz","-severity","info,low,medium,high,critical",
-              "-rl","5","-c","3","-timeout","5","-retries","1",
-              "-jsonl","-silent","-no-interactsh","-no-color","-disable-update-check"]
-        res=run_tool("nuclei",args,timeout=300)
-        if not res.get("available"):
-            return {"available":False,"status":"not_installed","targets_count":len(hosts),"results":[],
-                    "message":"Nuclei is not installed or not available on PATH."}
-        findings=[]; parsed=0; unparsed=0
-        stdout=res.get("stdout","")
-        for line in stdout.splitlines():
-            line=line.strip()
-            if not line: continue
-            try:
-                x=json.loads(line); parsed+=1; info=x.get("info") or {}
-                refs=info.get("reference") or []
-                if isinstance(refs,str): refs=[refs]
-                findings.append({"host":x.get("host") or x.get("matched-at"),
-                  "template_id":x.get("template-id") or x.get("templateID"),
-                  "name":info.get("name") or x.get("template"),
-                  "severity":info.get("severity","unknown"),
-                  "matched_at":x.get("matched-at") or x.get("matched"),
-                  "type":x.get("type"),"matcher_name":x.get("matcher-name"),
-                  "description":info.get("description"),
-                  "reference":refs[:5],
-                  "classification":info.get("classification")})
-            except Exception:
-                unparsed+=1
-        rc=res.get("returncode")
-        if res.get("error") or rc not in (0,None):
-            status="failed"
-            message=res.get("error") or f"Nuclei exited with code {rc}. Check diagnostics."
-        elif unparsed and not parsed:
-            status="parse_warning"
-            message="Nuclei returned output, but SCOPEZERO could not parse it as JSONL. Review the diagnostics."
-        elif findings:
-            status="matches_found"
-            message=f"Nuclei completed against {len(hosts)} public in-scope hostname(s) and reported {len(findings)} matching template result(s). Review and validate each result."
-        else:
-            status="no_matches"
-            message=("Nuclei completed successfully against the configured non-intrusive template set; "
-                     "no matching results were returned. This does not prove the hosts are vulnerability-free.")
-        return {"available":True,"status":status,"targets_count":len(hosts),"results":findings,
-                "parsed_lines":parsed,"unparsed_lines":unparsed,"stdout_bytes":len(stdout.encode("utf-8","replace")),
-                "stderr_tail":res.get("stderr","")[-1500:],"tool_error":res.get("error"),
-                "returncode":rc,"message":message,
-                "mode":"Non-intrusive misconfiguration, exposure and TLS templates only"}
+        for offset in range(0, len(hosts), batch_size):
+            batch = hosts[offset:offset + batch_size]
+            targets = Path(td) / f"targets-{offset // batch_size + 1}.txt"
+            targets.write_text("\n".join("https://" + h for h in batch) + "\n")
+            args = [
+                "-list", str(targets),
+                # Nuclei tag selectors are OR-based: cover HTTP checks,
+                # common misconfigurations and vulnerability templates.
+                "-tags", "http,misconfig,vuln,exposure,ssl",
+                "-exclude-tags", "dos,intrusive,fuzz,bruteforce,headless,code,file,network,workflow",
+                "-severity", "info,low,medium,high,critical",
+                "-rl", "10", "-c", "10", "-bulk-size", "5",
+                "-timeout", "7", "-retries", "0",
+                "-jsonl", "-silent", "-no-interactsh", "-no-color",
+                "-disable-update-check",
+            ]
+            res = run_tool("nuclei", args, timeout=120)
+            if res.get("status") == "timeout":
+                timed_out_batches += 1
+            elif res.get("error") or res.get("returncode") not in (0, None):
+                failed_batches += 1
+            else:
+                completed_batches += 1
+
+            batch_parsed = batch_unparsed = 0
+            for line in res.get("stdout", "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    x = json.loads(line)
+                    batch_parsed += 1
+                    info = x.get("info") or {}
+                    refs = info.get("reference") or []
+                    if isinstance(refs, str):
+                        refs = [refs]
+                    findings.append({
+                        "host": x.get("host") or x.get("matched-at"),
+                        "template_id": x.get("template-id") or x.get("templateID"),
+                        "name": info.get("name") or x.get("template"),
+                        "severity": info.get("severity", "unknown"),
+                        "matched_at": x.get("matched-at") or x.get("matched"),
+                        "type": x.get("type"), "matcher_name": x.get("matcher-name"),
+                        "description": info.get("description"), "reference": refs[:5],
+                        "classification": info.get("classification"),
+                    })
+                except Exception:
+                    batch_unparsed += 1
+            parsed += batch_parsed
+            unparsed += batch_unparsed
+            batch_diagnostics.append({
+                "batch": offset // batch_size + 1, "targets": len(batch),
+                "status": res.get("status"), "returncode": res.get("returncode"),
+                "elapsed_seconds": res.get("elapsed_seconds"),
+                "error": res.get("error"),
+                "stderr_tail": res.get("stderr", "")[-1200:],
+                "stdout_bytes": len(res.get("stdout", "").encode("utf-8", "replace")),
+            })
+
+    total_batches = len(batch_diagnostics)
+    if findings and (timed_out_batches or failed_batches):
+        status = "partial_results"
+        message = f"Nuclei returned {len(findings)} result(s); {completed_batches}/{total_batches} batches completed, {timed_out_batches} timed out and {failed_batches} failed. Review batch diagnostics."
+    elif timed_out_batches and not completed_batches:
+        status = "timeout"
+        message = f"All {timed_out_batches} Nuclei batch(es) timed out. Reduce the target set or check network reachability."
+    elif failed_batches and not completed_batches:
+        status = "failed"
+        message = f"All {failed_batches} Nuclei batch(es) failed. Review stderr and batch diagnostics."
+    elif timed_out_batches or failed_batches:
+        status = "partial_results"
+        message = f"Nuclei completed {completed_batches}/{total_batches} batches; {timed_out_batches} timed out and {failed_batches} failed. No complete assessment can be claimed."
+    elif unparsed and not parsed:
+        status = "parse_warning"
+        message = "Nuclei returned output, but SCOPEZERO could not parse it as JSONL. Review diagnostics."
+    elif findings:
+        status = "matches_found"
+        message = f"Nuclei completed against {len(hosts)} public in-scope host(s) and reported {len(findings)} matching template result(s). Validate each result."
+    else:
+        status = "no_matches"
+        message = "Nuclei completed the selected HTTP, misconfiguration, vulnerability, exposure and TLS template checks without matches. This does not prove the hosts are vulnerability-free."
+
+    return {
+        "available": True, "status": status, "targets_count": len(hosts),
+        "omitted_after_target_cap": omitted, "not_checked_during_preflight": not_checked,
+        "results": findings, "parsed_lines": parsed, "unparsed_lines": unparsed,
+        "completed_batches": completed_batches, "total_batches": total_batches,
+        "timed_out_batches": timed_out_batches, "failed_batches": failed_batches,
+        "batch_diagnostics": batch_diagnostics, "message": message,
+        "mode": "HTTP-focused Nuclei templates tagged http, misconfig, vuln, exposure and ssl; intrusive classes excluded; batches of 5; findings require analyst validation",
+    }
 
 def katana_crawl(hosts):
-    hosts=[h for h in hosts if is_public_host(h)]
-    if not hosts:return {"available":shutil.which('katana') is not None,"urls":[],"message":"No eligible public hosts."}
-    urls=[]
+    hosts,omitted,not_checked=public_hosts(hosts,limit=25)
+    if not hosts:return {"available":shutil.which('katana') is not None,"status":"preflight_incomplete" if not_checked else "no_targets","urls":[],"not_checked_during_preflight":not_checked,"message":"Preflight limit reached before any eligible host was confirmed; narrow the asset set and retry." if not_checked else "No eligible public hosts."}
+    urls=[]; errors=[]
     for host in hosts[:25]:
         res=run_tool('katana',["-u","https://"+host,"-d","2","-jc","-silent","-crawl-scope",r".*\."+re.escape(host)+r"$|https?://"+re.escape(host)+r"(/|$)"],timeout=90)
         if res.get('stdout'):
             for u in res['stdout'].splitlines():
                 p=urlparse(u.strip())
                 if p.hostname==host or (p.hostname and p.hostname.endswith('.'+host)): urls.append(u.strip())
-    return {"available":shutil.which('katana') is not None,"hosts_crawled":min(len(hosts),25),"urls":sorted(set(urls))[:3000],"mode":"Depth-2 crawl; same-host URLs retained"}
+        if res.get("error") or res.get("returncode") not in (0,None): errors.append({"host":host,"status":res.get("status"),"error":res.get("error"),"stderr_tail":res.get("stderr","")[-1000:]})
+    return {"available":shutil.which('katana') is not None,"status":("timeout" if errors and not urls and all("timed out" in str(x.get("error","")).lower() for x in errors) else "execution_error") if errors and not urls else "partial_results" if errors and urls else "matches_found" if urls else "no_matches","hosts_crawled":len(hosts),"omitted_after_target_cap":omitted,"not_checked_during_preflight":not_checked,"urls":sorted(set(urls))[:3000],"errors":errors,"mode":"Depth-2 crawl; same-host URLs retained"}
 
 def scan_secrets(repo_path):
     root=Path(repo_path).expanduser().resolve()
@@ -223,7 +314,7 @@ def subfinder_scan(domain, timeout=90):
         h=line.strip().lower().rstrip(".")
         if h and (h==domain or h.endswith("."+domain)) and re.fullmatch(r"[a-z0-9.-]+",h):
             hosts.add(h)
-    status="failed" if res.get("error") or res.get("returncode") not in (0,None) else ("matches_found" if hosts else "no_matches")
+    status=(res.get("status") if res.get("status") not in (None,"completed") else ("failed" if res.get("error") or res.get("returncode") not in (0,None) else ("matches_found" if hosts else "no_matches")))
     if res.get("error"):
         message=res["error"]
     elif res.get("returncode") not in (0,None):
@@ -240,41 +331,54 @@ _GOBUSTER_WORDS=("admin","api","assets","backup","config","dashboard","docs","he
                  "login","portal","robots.txt","sitemap.xml","static","status","uploads",
                  "user","users","v1","v2","well-known")
 def gobuster_scan(hosts, max_hosts=6, timeout=150):
-    """Low-rate, bounded directory discovery against public hosts already in scan scope."""
-    hosts=[h for h in hosts if is_public_host(h)]
+    """Run compatibility-focused, low-rate Gobuster directory discovery."""
+    hosts, omitted, not_checked = public_hosts(hosts, limit=max_hosts)
+    path = shutil.which("gobuster")
     if not hosts:
-        return {"available":shutil.which("gobuster") is not None,"status":"no_targets","hosts_scanned":0,
-                "results":[],"message":"No discovered public hostnames are eligible for directory discovery."}
-    path=shutil.which("gobuster")
+        return {"available": bool(path), "status": "preflight_incomplete" if not_checked else "no_targets",
+                "hosts_scanned": 0, "not_checked_during_preflight": not_checked, "results": [],
+                "message": "Preflight limit reached; narrow the asset set and retry." if not_checked else "No discovered public hostnames are eligible."}
     if not path:
-        return {"available":False,"status":"not_installed","hosts_scanned":0,"results":[],
-                "message":"Gobuster is not installed or not available on PATH."}
-    results=[]; host_errors=[]; scanned=[]
+        return {"available": False, "status": "not_installed", "hosts_scanned": 0, "results": [],
+                "message": "Gobuster is not installed or not available on PATH."}
+    results, host_errors, scanned = [], [], []
     with tempfile.TemporaryDirectory(prefix="scopezero-gobuster-") as td:
-        wordfile=Path(td)/"bounded-paths.txt"
-        wordfile.write_text("\n".join(_GOBUSTER_WORDS)+"\n")
+        wordfile = Path(td) / "bounded-paths.txt"
+        wordfile.write_text("\n".join(_GOBUSTER_WORDS) + "\n")
         for host in hosts[:max_hosts]:
-            url="https://"+host
-            args=["dir","-u",url,"-w",str(wordfile),"-x","json,yaml,yml,xml,txt",
-                  "-t","5","--delay","100ms","--timeout","5s","--no-progress","-q","--no-error"]
-            res=run_tool("gobuster",args,timeout=min(timeout,45))
+            url = "https://" + host
+            # Avoid optional flags that vary between distro-packaged Gobuster builds.
+            args = ["dir", "-u", url, "-w", str(wordfile), "-x", "json,yaml,yml,xml,txt",
+                    "-t", "5", "--delay", "100ms", "--timeout", "8s", "-q"]
+            res = run_tool("gobuster", args, timeout=min(max(15, int(timeout)), 60))
             if not res.get("available"):
-                return {"available":False,"status":"not_installed","hosts_scanned":0,"results":[],
-                        "message":"Gobuster is not installed or not available on PATH."}
-            scanned.append(host)
-            if res.get("error") or res.get("returncode") not in (0,None):
-                host_errors.append({"host":host,"error":res.get("error") or f"exit code {res.get('returncode')}",
-                                    "stderr":res.get("stderr","")[-500:]})
-            for line in res.get("stdout","").splitlines():
-                match=re.search(r"^(/\S+)\s+\(Status:\s*(\d{3})\)(?:\s+\[Size:\s*(\d+)\])?",line.strip())
+                return {"available": False, "status": "not_installed", "hosts_scanned": len(scanned),
+                        "results": results, "message": "Gobuster executable could not be resolved at launch."}
+            if res.get("error") or res.get("returncode") not in (0, None):
+                host_errors.append({"host": host, "status": res.get("status", "execution_error"),
+                                    "error": res.get("error") or f"exit code {res.get('returncode')}",
+                                    "stderr": res.get("stderr", "")[-1500:], "diagnostics": res.get("diagnostics")})
+            else:
+                scanned.append(host)
+            # Gobuster v3 output: /path (Status: 200) [Size: 123].
+            for line in res.get("stdout", "").splitlines():
+                match = re.search(r"(/\S+)\s+\(Status:\s*(\d{3})\)(?:\s+\[Size:\s*(\d+)\])?", line.strip())
                 if match:
-                    results.append({"host":host,"path":match.group(1),"url":url+match.group(1),
-                                    "status":int(match.group(2)),"size":int(match.group(3)) if match.group(3) else None,
-                                    "source":"Gobuster"})
-    status="failed" if not scanned and host_errors else ("matches_found" if results else "no_matches")
-    message=(f"Gobuster checked {len(scanned)} host(s) and found {len(results)} path response(s)." if results else
-             f"Gobuster completed its bounded wordlist against {len(scanned)} host(s) with no matching path responses." if scanned else
-             "Gobuster could not complete against any eligible host.")
-    return {"available":True,"status":status,"hosts_scanned":len(scanned),"host_limit":max_hosts,
-             "word_count":len(_GOBUSTER_WORDS),"extensions":["json","yaml","yml","xml","txt"],"results":results,"host_errors":host_errors,
-            "message":message,"mode":"Bounded 19-path wordlist, 5 workers, 100 ms delay; public in-scope discovered hosts only"}
+                    results.append({"host": host, "path": match.group(1), "url": url + match.group(1),
+                                    "status": int(match.group(2)), "size": int(match.group(3)) if match.group(3) else None,
+                                    "source": "Gobuster"})
+    if host_errors and results:
+        status = "partial_results"
+    elif host_errors and not scanned:
+        kinds = {x.get("status") for x in host_errors}
+        status = "timeout" if kinds == {"timeout"} else ("permission_error" if kinds == {"permission_error"} else "execution_error")
+    else:
+        status = "matches_found" if results else "no_matches"
+    message = (f"Gobuster found {len(results)} path response(s) across {len(scanned)} completed host(s)." if results else
+               f"Gobuster completed its bounded wordlist against {len(scanned)} host(s) with no matching path responses." if scanned else
+               "Gobuster did not complete against any eligible host; inspect per-host diagnostics.")
+    return {"available": True, "status": status, "hosts_scanned": len(scanned), "host_limit": max_hosts,
+            "word_count": len(_GOBUSTER_WORDS), "extensions": ["json", "yaml", "yml", "xml", "txt"],
+            "results": results, "host_errors": host_errors, "omitted_after_target_cap": omitted,
+            "not_checked_during_preflight": not_checked, "message": message,
+            "mode": "Bounded 19-path wordlist, 5 workers, 100 ms delay; public in-scope discovered hosts only"}

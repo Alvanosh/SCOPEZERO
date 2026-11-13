@@ -1,4 +1,4 @@
-# Capability boundaries — 10.7.0
+# Capability boundaries — 10.8.0
 
 This document distinguishes automated behavior from analyst-led workflows and investigation signals.
 

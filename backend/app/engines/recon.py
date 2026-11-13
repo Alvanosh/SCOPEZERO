@@ -15,13 +15,34 @@ def _domain_ok(domain):
 def _hosts_ok(hosts, domain, limit=80):
     return sorted({h.lower().rstrip('.') for h in hosts if isinstance(h,str) and (h.lower().rstrip('.')==domain or h.lower().rstrip('.').endswith('.'+domain))})[:limit]
 
-def amass_passive(domain, timeout=180):
-    if not _domain_ok(domain): return {"available":False,"status":"invalid_scope","hosts":[],"message":"Invalid root domain."}
-    if not shutil.which('amass'): return {"available":False,"status":"not_installed","hosts":[],"message":"Amass is not installed or not on PATH."}
-    r=run_tool('amass',['enum','-passive','-d',domain,'-timeout','3','-silent'],timeout=timeout)
-    hosts=_hosts_ok(r.get('stdout','').splitlines(),domain)
-    status='failed' if r.get('error') or r.get('returncode') not in (0,None) else ('matches_found' if hosts else 'no_matches')
-    return {"available":True,"status":status,"hosts":hosts,"count":len(hosts),"returncode":r.get('returncode'),"stderr_tail":r.get('stderr','')[-1200:],"message":r.get('error') or f"Amass passive mode returned {len(hosts)} in-scope hostnames.","mode":"Passive only; no brute force, port scans or active validation"}
+def amass_passive(domain, timeout=95):
+    """Run bounded passive Amass enumeration and preserve partial results."""
+    if not _domain_ok(domain):
+        return {"available": False, "status": "invalid_scope", "hosts": [], "message": "Invalid root domain."}
+    if not shutil.which("amass"):
+        return {"available": False, "status": "not_installed", "hosts": [], "message": "Amass is not installed or not on PATH."}
+    # Amass enum's timeout is in minutes. Keep its internal limit below the
+    # subprocess watchdog; cap wall time so one provider cannot stall a scan.
+    outer_timeout = min(max(int(timeout), 30), 110)
+    r = run_tool("amass", ["enum", "-passive", "-d", domain, "-timeout", "1", "-silent"], timeout=outer_timeout)
+    hosts = _hosts_ok(r.get("stdout", "").splitlines(), domain)
+    raw_status = r.get("status")
+    if raw_status == "timeout" and hosts:
+        status = "partial_results"
+        message = f"Amass timed out after returning {len(hosts)} in-scope hostname candidate(s); partial output was retained."
+    elif raw_status not in (None, "completed"):
+        status = raw_status
+        message = r.get("error") or f"Amass ended with status {raw_status}."
+    elif r.get("error") or r.get("returncode") not in (0, None):
+        status = "execution_error"
+        message = r.get("error") or f"Amass exited with code {r.get('returncode')}."
+    else:
+        status = "matches_found" if hosts else "no_matches"
+        message = f"Amass passive mode completed and returned {len(hosts)} in-scope hostname candidate(s)."
+    return {"available": True, "status": status, "hosts": hosts, "count": len(hosts),
+            "returncode": r.get("returncode"), "stderr_tail": r.get("stderr", "")[-3000:],
+            "diagnostics": r.get("diagnostics"), "elapsed_seconds": r.get("elapsed_seconds"),
+            "message": message, "mode": "Passive only; one-minute internal limit and bounded subprocess watchdog; no brute force, port scans or active validation"}
 
 def dnsx_records(hosts, domain, timeout=90):
     if not shutil.which('dnsx'): return {"available":False,"status":"not_installed","records":[],"message":"dnsx is not installed or not on PATH."}
@@ -38,8 +59,8 @@ def dnsx_records(hosts, domain, timeout=90):
         if m:
             records.append({"host":m.group(1),"response":m.group(2)[:500],"source":"dnsx"})
         else: records.append({"host":line.split()[0],"response":line[:500],"source":"dnsx"})
-    status='failed' if r.get('error') or r.get('returncode') not in (0,None) else ('matches_found' if records else 'no_matches')
-    return {"available":True,"status":status,"hosts_checked":len(targets),"records":records[:500],"count":len(records),"returncode":r.get('returncode'),"stderr_tail":r.get('stderr','')[-1200:],"message":f"dnsx checked {len(targets)} in-scope hostnames and returned {len(records)} record lines."}
+    status=(r.get('status') if r.get('status') not in (None,'completed') else ('failed' if r.get('error') or r.get('returncode') not in (0,None) else ('matches_found' if records else 'no_matches')))
+    return {"available":True,"status":status,"hosts_checked":len(targets),"records":records[:500],"count":len(records),"returncode":r.get('returncode'),"stderr_tail":r.get('stderr','')[-3000:],"diagnostics":r.get('diagnostics'),"elapsed_seconds":r.get('elapsed_seconds'),"message":r.get('error') or f"dnsx checked {len(targets)} in-scope hostnames and returned {len(records)} record lines."}
 
 _CLOUD_WORDS=('www','api','cdn','assets','static','media','files','storage','backup','dev','stage','staging','test','portal','app','uploads','docs','images','s3','blob','cloud')
 _CLOUD_SUFFIXES=('amazonaws.com','cloudfront.net','azurewebsites.net','blob.core.windows.net','storage.googleapis.com','appspot.com','digitaloceanspaces.com')
@@ -87,6 +108,8 @@ def crt_hosts(domain):
                 if n==domain or n.endswith('.'+domain): names.add(n)
         hosts=sorted(names)[:1000]
         return {"available":True,"status":"matches_found" if hosts else "no_matches","hosts":hosts,"count":len(hosts),"message":f"Certificate Transparency returned {len(hosts)} unique in-scope DNS names.","mode":"Public CT log search; certificate presence does not prove current DNS or ownership"}
+    except requests.Timeout: return {"available":True,"status":"network_error","hosts":[],"message":"Certificate Transparency lookup timed out; the remote service may be slow or unreachable."}
+    except requests.RequestException as e: return {"available":True,"status":"network_error","hosts":[],"message":f"Certificate Transparency network request failed: {type(e).__name__}"}
     except Exception as e: return {"available":True,"status":"failed","hosts":[],"message":f"CT lookup failed: {type(e).__name__}"}
 
 def securitytrails_domain(domain):

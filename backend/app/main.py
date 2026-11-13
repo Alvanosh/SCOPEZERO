@@ -824,7 +824,7 @@ class ValidationIn(BaseModel):
 
 def _store_offensive(sid, module, results):
     status=results.get("status")
-    if status in ("failed","parse_warning","not_installed","not_configured","no_targets","no_matches","invalid_scope","invalid_input","ready"):
+    if status in ("failed","timeout","execution_error","permission_error","network_error","preflight_incomplete","partial_results","parse_warning","not_installed","not_configured","no_targets","no_matches","invalid_scope","invalid_input","ready"):
         stored_status=status
     elif results.get("error") or results.get("tool_error") or results.get("returncode") not in (0,None):
         stored_status="failed"

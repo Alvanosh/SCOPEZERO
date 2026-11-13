@@ -66,26 +66,24 @@ def permutations(domain, discovered):
 
 
 import subprocess, shutil, ipaddress
+from .process import run_binary
 
 def external_enumerators(domain, timeout=90):
-    """Run installed passive enumerators concurrently; retain only in-scope names."""
+    """Run installed passive enumerators concurrently with bounded process cleanup."""
     def run(item):
-        tool,args=item; path=shutil.which(tool)
-        if not path: return tool,{"available":False,"hosts":[],"error":"Not installed"}
-        try:
-            proc=subprocess.run([path,*args],capture_output=True,text=True,timeout=timeout,check=False)
-            hosts=set()
-            for line in proc.stdout.splitlines():
-                h=line.strip().lower().rstrip(".")
-                if h and (h==domain or h.endswith("."+domain)) and re.fullmatch(r"[a-z0-9.-]+",h):
-                    hosts.add(h)
-            return tool,{"available":True,"hosts":sorted(hosts),"returncode":proc.returncode,
-                "error":proc.stderr[-400:] if proc.returncode and proc.stderr else None}
-        except subprocess.TimeoutExpired:
-            return tool,{"available":True,"hosts":[],"error":f"Timed out after {timeout}s"}
-        except Exception as e:
-            return tool,{"available":True,"hosts":[],"error":type(e).__name__}
-    commands=(("subfinder",["-d",domain,"-silent"]),("amass",["enum","-passive","-d",domain]))
+        tool,args=item
+        result=run_binary(tool,args,timeout=timeout)
+        hosts=set()
+        for line in result.get("stdout","").splitlines():
+            h=line.strip().lower().rstrip(".")
+            if h and (h==domain or h.endswith("."+domain)) and re.fullmatch(r"[a-z0-9.-]+",h):
+                hosts.add(h)
+        return tool,{"available":result.get("available",False),"status":result.get("status"),
+            "hosts":sorted(hosts),"returncode":result.get("returncode"),
+            "error":result.get("error"),"stderr_tail":result.get("stderr","")[-1500:],
+            "diagnostics":result.get("diagnostics"),"elapsed_seconds":result.get("elapsed_seconds")}
+    commands=(("subfinder",["-d",domain,"-silent","-timeout","10","-max-time","1","-duc"]),
+              ("amass",["enum","-passive","-d",domain,"-timeout","2","-silent"]))
     with ThreadPoolExecutor(max_workers=2) as pool:
         return dict(pool.map(run,commands))
 

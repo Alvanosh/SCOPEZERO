@@ -1,6 +1,6 @@
 # Architecture overview
 
-SCOPEZERO 10.7.0 is organized as a local web application:
+SCOPEZERO 10.8.0 is organized as a local web application:
 
 - `backend/app/main.py` exposes the FastAPI application and HTTP routes.
 - `backend/app/database.py` initializes and accesses the local SQLite database.
@@ -19,3 +19,8 @@ The backend stores engagement and scan state locally. Assessment output, evidenc
 5. Findings can be tracked, compared and included in reports.
 
 Scope checks and individual module restrictions are implemented in the application, but they do not replace human authorization and engagement oversight.
+
+
+## Tool execution lifecycle
+
+Command adapters use `engines/process.py`, which resolves binaries through the backend process PATH, launches argument arrays without a shell, captures bounded stdout/stderr, records elapsed time and exit code, and terminates the full child process group when a timeout occurs. Adapters map tool outcomes to distinct states (`no_matches`, `timeout`, `permission_error`, `execution_error`, `network_error`, and others). Target caps and preflight omissions are returned explicitly.
