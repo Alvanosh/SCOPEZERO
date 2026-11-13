@@ -1,115 +1,173 @@
 # SCOPEZERO
 
-**Version:** 10.8.0  
-**Project:** Security assessment and investigation workspace  
-**Status:** Early-stage development / feedback release
+### REDLINE — Advanced Security Assessment & Investigation Platform
 
-SCOPEZERO is a local operator workspace for organizing authorized security assessments. It brings asset discovery, technology and vulnerability intelligence, web investigation, API access-control observations, authenticated test identities, differential checks, evidence and reporting workflows into one interface.
+**Version:** 14.0.0  
+**Project:** Security assessment, reconnaissance and web application testing workspace  
+**Platform:** Linux / Kali Linux  
+**Status:** Active Development
 
-> **Authorization required.** Use SCOPEZERO only against systems for which you have explicit permission and a clearly defined scope. You are responsible for obtaining authorization, respecting engagement rules, and complying with applicable law.
+SCOPEZERO is a modular security assessment platform designed to bring reconnaissance, attack-surface discovery, vulnerability intelligence, web application testing, HTTP traffic inspection and evidence management into one unified workspace.
 
-## Current capabilities
+Built for security researchers, penetration testers and cybersecurity enthusiasts, SCOPEZERO combines local security tools with an integrated web testing environment.
 
-- Engagement and scan workspace with asset and finding inventories.
-- Reconnaissance and network/web discovery workflows using configured local tools.
-- Technology observations and CVE/EPSS/KEV intelligence correlation.
-- Web request investigation and bounded, low-impact security checks.
-- API access-control observation matrix for analyst-recorded test results.
-- Authenticated web test identities with encrypted request headers at rest.
-- Differential response comparisons between explicitly authorized test identities.
-- Evidence records, investigation notes, finding triage and reporting workflows.
+> **Authorization required:** SCOPEZERO must only be used against systems for which you have explicit permission to perform security testing.
 
-Some modules are analyst-led or provide investigation signals rather than confirmed vulnerability results. CVE matches, response differences, reflected markers and error messages must be manually validated. A negative check does not prove that a vulnerability is absent. Refer to [Capability boundaries](docs/capability-boundaries.md).
+---
 
-## Repository layout
+## Core capabilities
+
+### 1. Reconnaissance and attack-surface discovery
+- Domain and subdomain discovery.
+- DNS and infrastructure intelligence.
+- HTTP service discovery and probing.
+- Network and port assessment.
+- Technology and service observations.
+
+### 2. Offensive security toolkit
+- Nmap-based network assessment.
+- Nuclei template-based vulnerability checks.
+- Gobuster directory and content discovery.
+- Subfinder and HTTPX reconnaissance pipeline.
+- Technology fingerprinting and infrastructure identification.
+- Configurable assessment workflows.
+
+### 3. SCOPEZERO Web Suite
+An integrated environment for authorized web application security testing.
+
+- HTTP/HTTPS traffic inspection.
+- Browser traffic capture integration.
+- Intercept, forward and drop controls.
+- HTTP Repeater for editable requests.
+- Intruder-style controlled payload testing.
+- Request and response inspection.
+- Target sitemap and endpoint overview.
+- Custom wordlist support for bounded fuzzing.
+
+### 4. Browser Capture Extension
+The SCOPEZERO Browser Capture extension connects supported browsers to the local assessment backend.
+
+Features:
+- Browser request capture.
+- In-scope traffic filtering.
+- Request metadata collection.
+- Integration with the Web Suite.
+
+### 5. Vulnerability intelligence
+- CVE correlation.
+- CVSS and EPSS enrichment.
+- CISA KEV intelligence.
+- Technology and service observations.
+- Evidence-based vulnerability review.
+
+### 6. API security assessment
+- API endpoint inventory.
+- Authentication and authorization review.
+- Identity-based response comparison.
+- API access-control observation records.
+
+### 7. Evidence and reporting
+- Centralized assessment evidence.
+- Finding management.
+- Investigation notes.
+- Assessment history.
+- Reporting workflows.
+
+---
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Alvanosh/SCOPEZERO.git
+cd SCOPEZERO
+```
+
+Create a virtual environment:
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Configure environment variables:
+
+```bash
+cp ../.env.example .env
+nano .env
+```
+
+Set your own local secrets and configuration values. Never publish the populated `.env` file.
+
+Start the application using the project's configured startup instructions.
+
+---
+
+## Browser extension installation
+
+1. Open `brave://extensions` or `chrome://extensions`.
+2. Enable Developer mode.
+3. Select **Load unpacked**.
+4. Choose the `browser-extension` directory.
+5. Configure the backend URL and assessment settings.
+6. Use the extension with an authorized assessment session.
+
+For HTTPS interception, use the dedicated assessment browser profile and the SCOPEZERO local CA certificate. Remove the certificate after testing.
+
+---
+
+## Project structure
 
 ```text
 SCOPEZERO/
 ├── backend/
 │   ├── app/
 │   │   ├── engines/
-│   │   │   └── process.py
-│   │   ├── main.py
-│   │   ├── database.py
-│   │   ├── config.py
-│   │   ├── pipeline.py
-│   │   └── worker.py
+│   │   └── main.py
 │   └── requirements.txt
+├── browser-extension/
 ├── frontend/
-│   └── index.html
 ├── docs/
-│   ├── architecture.md
-│   ├── capability-boundaries.md
-│   ├── installation-kali.md
-│   └── security-and-data-handling.md
 ├── tests/
-│   └── test_tool_execution.py
-├── screenshots/
 ├── .env.example
 ├── .gitignore
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
-├── SECURITY.md
+├── LICENSE
 └── README.md
 ```
 
-Local databases, evidence attachments, reports, virtual environments, credentials and encryption keys are intentionally excluded from source control.
+---
 
-## Quick start — Kali Linux
+## Security and responsible use
 
-```bash
-git clone <YOUR-GITHUB-REPOSITORY-URL>
-cd SCOPEZERO/backend
+- Use only against explicitly authorized targets.
+- Keep API keys, tokens and credentials outside source control.
+- Never publish database files or assessment evidence containing sensitive data.
+- Protect local interception CA private keys.
+- Use a dedicated browser profile for HTTPS interception.
+- Review engagement scope before running active assessment tools.
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+## Development
 
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+SCOPEZERO is under active development. Features, integrations and assessment workflows are continuously evolving.
 
-Open **http://127.0.0.1:8000** in your browser. Keep the service bound to `127.0.0.1` for local use. See [Kali installation](docs/installation-kali.md) for details.
-
-## Tool execution reliability — 10.8.0
-
-This release improves local tool execution and diagnostics:
-
-- Shared subprocess runner with process-group cleanup on timeout and captured partial stdout/stderr.
-- Structured states for timeouts, launch failures, permission errors, network failures and empty successful results.
-- Nmap and Nuclei preflight target caps; DNS eligibility checks are bounded and parallelized.
-- Naabu uses TCP connect mode to avoid requiring raw-packet privileges for the default workflow.
-- httpx uses bounded concurrency and request rate; large target sets are capped with omitted counts.
-- Per-tool diagnostics include resolved binary path, elapsed time, exit code and output tails.
-
-A cap is reported explicitly; it is not a claim that omitted hosts were scanned. Tool results remain signals requiring analyst validation.
-
-## External tools
-
-Some reconnaissance and assessment workflows depend on separately installed command-line tools and optional intelligence providers. The application may still start when optional tools are absent, but workflows requiring them will not be fully available. Configure only tools and providers you are authorized to use. Do not commit API keys.
-
-## Important security notes
-
-- Keep SCOPEZERO bound to localhost. This release is not a hardened multi-user or internet-facing deployment.
-- Do not upload real engagement databases, evidence, request/response captures, reports, credentials or client data to this repository.
-- The authenticated-session feature encrypts stored request headers using a local Fernet key generated at runtime. **Back up `backend/.session_vault.key` securely with the corresponding local database. Never commit or share the key.** Losing it makes stored identity headers undecryptable.
-- Do not expose the app to an untrusted network. Authentication, TLS, deployment hardening and a production secrets-management design are required before any shared deployment.
-- See [Security and data handling](docs/security-and-data-handling.md).
-
-## Development and feedback
-
-This is an early-stage project. Please report reproducible bugs, setup issues, false positives, confusing workflows and feature requests through GitHub Issues. Read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+Contributions, bug reports and responsible security feedback are welcome.
 
 ## License
 
-No open-source license has been selected for this release. Unless a license is added by the project owner, all rights are reserved; do not assume permission to redistribute or use this code commercially.
+MIT License. See [LICENSE](LICENSE) for details.
 
+---
 
-### Nuclei template selection (10.10.0)
+**SCOPEZERO // REDLINE**
 
-The Nuclei adapter selects HTTP, misconfiguration, vulnerability, exposure and TLS-tagged templates, while excluding known intrusive template classes. It runs in bounded batches of five hosts (up to 25 eligible hosts per invocation), records per-batch diagnostics, and distinguishes partial completion from a successful no-match result. Template findings are candidates for analyst validation, not automatic proof of exploitability. Only run against explicitly authorized assets.
-
-
-### 10.10.0 tool reliability updates
-
-Gobuster now uses a smaller cross-version flag set and reports per-host launch diagnostics. Amass passive enumeration uses a bounded one-minute internal limit and preserves in-scope partial output when the subprocess watchdog expires. These changes are covered by adapter regression tests; live Kali execution still needs confirmation in your environment.
+*Reconnaissance. Inspection. Intelligence. Assessment.*
